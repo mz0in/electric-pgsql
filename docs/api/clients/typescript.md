@@ -14,83 +14,6 @@ The Typescript client provides a number of functions for developing front-end ap
 - [Type-safe data access](#queries) to read and update the database
 - [Reactive live queries](#live-queries) that update in realtime as the database changes
 
-## Configuration
-
-The Electric client has a few configuration options that are defined on the `ElectricConfig` type available in
-`electric-sql/config`. At a minimum, you have to include in the config object the URL to your instance of the
-[sync service](../../usage/installation/service) and an [auth token](../../usage/auth), for example:
-
-```ts
-const config: ElectricConfig = {
-  url: 'http://my-app-domain',
-  auth: {
-    token: 'eyJ0eXAiOiJKV1QiLCJhbGciOiJub25lIn0...'
-  }
-}
-```
-
-### Available options
-
-- `auth: AuthConfig`
-
-   Authentication object that includes an auth token and an optional client ID.
-
-   The auth token must be a JWT that the Electric sync service will be able to validate.
-
-   Client ID is a unique identifier for this particular client or device. If omitted, a random UUID will be generated
-   the first time this client connects to the sync service.
-
-- `url?: string` (default: `"http://localhost:5133"`)
-
-   URL of the Electric sync service to connect to.
-
-   Should have the following format:
-
-   ```
-   protocol://<host>:<port>[?ssl=true]
-   ```
-
-   If the protocol is `https` or `wss` then `ssl` defaults to true. Otherwise it defaults to false.
-
-   If port is not provided, defaults to 443 when ssl is enabled or 80 when it isn't.
-
-- `debug?: boolean` (default: `false`)
-
-  Activate debug mode which logs the replication messages that are exchanged between the client and the sync service.
-
-- `timeout?: number` (default: `3000`)
-
-  Timeout (in milliseconds) for RPC requests.
-
-  Needs to be large enough for the server to have time to deliver the full initial subscription data
-  when the client subscribes to a shape for the first time.
-
-
-- `connectionBackOffOptions?: ConnectionBackOffOptions`
-
-   Configuration of the backoff strategy used when trying to reconnect to the Electric sync service after a failed
-   connection attempt.
-
-### Configuring example apps
-
-In our example apps and in apps created with `npx create-electric-app`, the `url` and `debug` options are looked up as
-`ELECTRIC_URL` and `DEBUG_MODE` environment variables, respectively.
-
-So, for example, to include the URL of a hosted instance of Electric into the production build of your app, put it in
-the `ELECTRIC_URL` environment variable when running your build command:
-
-```shell
-ELECTRIC_URL=https://my-app-domain.com npm run build
-# or
-ELECTRIC_URL=wss://my-app-domain.com npm run build
-```
-
-To run your app in development with debug mode enabled:
-
-```shell
-ELECTRIC_URL=http://localhost:5133 DEBUG_MODE=true npm run start
-```
-
 ## Instantiation
 
 A Typescript client comprises of:
@@ -132,8 +55,9 @@ export type ClientTables<DB> = {
 }
 
 interface RawQueries {
-  raw(sql: Statement): Promise<Row[]>
-  liveRaw(sql: Statement): LiveResultContext<any>
+  rawQuery(sql: Statement): Promise<Row[]>
+  liveRawQuery(sql: Statement): LiveResultContext<any>
+  unsafeExec(sql: Statement): Promise<Row[]>
 }
 
 type Statement = {
@@ -145,8 +69,8 @@ type Statement = {
 
 The Electric client above defines a property for every table in our data model: `electric.db.users`, `electric.db.projects`, etc.
 The API of these tables is explained below when we discuss the [supported queries](#queries).
-In addition, one can execute raw SQL queries using the `electric.db.raw` and `electric.db.liveRaw` escape patches.
-Raw queries should be used with caution as they are unchecked and may cause the sync service to stop if they are ill-formed.
+In addition, one can execute raw read-only SQL queries using the `electric.db.rawQuery` and `electric.db.liveRawQuery` escape patches.
+It is also possible to execute raw queries that can modify the store using `electric.db.unsafeExec`, but it should be used with caution as the changes are unchecked and may cause the sync service to stop if they are ill-formed.
 Therefore, only use raw queries for features that are not supported by our regular API.
 
 ## Configuration
@@ -223,7 +147,7 @@ ELECTRIC_URL=wss://my-app-domain.com npm run build
 To run your app in development with debug mode enabled:
 
 ```shell
-ELECTRIC_URL=http://localhost:5133 DEBUG_MODE=true npm run start
+ELECTRIC_URL=http://localhost:5133 DEBUG_MODE=true npm run dev
 ```
 
 ## Shapes

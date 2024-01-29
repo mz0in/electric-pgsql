@@ -25,8 +25,8 @@ defmodule Electric.Replication.Postgres.Writer do
   def init(opts) do
     conn_config = Keyword.fetch!(opts, :conn_config)
     origin = Connectors.origin(conn_config)
-
-    :gproc.reg(name(origin))
+    name = name(origin)
+    Electric.reg(name)
 
     Logger.metadata(origin: origin)
 
@@ -76,8 +76,8 @@ defmodule Electric.Replication.Postgres.Writer do
   # Private functions
   ###
 
-  defp name(name) do
-    {:n, :l, {__MODULE__, name}}
+  defp name(origin) do
+    Electric.name(__MODULE__, origin)
   end
 
   defp send_transaction(tx, _pos, state) do
@@ -172,7 +172,7 @@ defmodule Electric.Replication.Postgres.Writer do
   defp encode_value("f", :bool), do: "false"
 
   defp encode_value(bin, :bytea),
-    do: bin |> Electric.Postgres.Bytea.to_postgres_hex() |> quote_string()
+    do: bin |> Electric.Postgres.Types.Bytea.to_postgres_hex() |> quote_string()
 
   defp encode_value(val, float_type) when float_type in [:float4, :float8] do
     case Float.parse(val) do
