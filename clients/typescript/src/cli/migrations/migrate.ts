@@ -250,7 +250,7 @@ async function _generate(opts: Omit<GeneratorOptions, 'watch'>) {
     // Fetch the migrations from Electric endpoint and write them into `tmpFolder`
     await fetchMigrations(migrationEndpoint, migrationsFolder, tmpFolder)
 
-    const prismaSchema = await createPrismaSchema(tmpFolder, opts)
+    const prismaSchema = await createIntrospectionSchema(tmpFolder, opts)
 
     // Introspect the created DB to update the Prisma schema
     await introspectDB(prismaSchema)
@@ -261,8 +261,21 @@ async function _generate(opts: Omit<GeneratorOptions, 'watch'>) {
     // Modify snake_case table names to PascalCase
     await capitaliseTableNames(prismaSchema)
 
-    // Generate a client from the Prisma schema
+    // Read the contents of the Prisma schema
+    const introspectedSchema = await fs.readFile(prismaSchema, 'utf8')
+
+    // Add a generator for the Electric client to the Prisma schema
+    await createElectricClientSchema(introspectedSchema, prismaSchema, opts)
+
+    // Generate the Electric client from the Prisma schema
     await generateElectricClient(prismaSchema)
+
+    // Add a generator for the Prisma client to the Prisma schema
+    await createPrismaClientSchema(introspectedSchema, prismaSchema, opts)
+
+    // Generate the Prisma client from the Prisma schema
+    await generatePrismaClient(prismaSchema)
+
     const relativePath = path.relative(appRoot, config.CLIENT_PATH)
     // Modify the type of JSON input values in the generated Prisma client
     // because we deviate from Prisma's typing for JSON values
@@ -288,11 +301,8 @@ async function _generate(opts: Omit<GeneratorOptions, 'watch'>) {
     console.error('generate command failed: ' + e)
     throw e
   } finally {
-    // Delete our temporary directory unless
-    // generation failed in debug mode
-    if (!generationFailed || !opts.debug) {
-      await fs.rm(tmpFolder, { recursive: true })
-    }
+    // Delete our temporary directory unless in debug mode
+    if (!opts.debug) await fs.rm(tmpFolder, { recursive: true })
 
     // In case of process exit, make sure to run after folder removal
     if (generationFailed && opts.exitOnError) process.exit(1)
@@ -326,29 +336,75 @@ function buildProxyUrlForIntrospection(config: Config) {
  * Creates a fresh Prisma schema in the provided folder.
  * The Prisma schema is initialised with a generator and a datasource.
  */
-async function createPrismaSchema(folder: string, opts: GeneratorOptions) {
+async function createIntrospectionSchema(
+  folder: string,
+  opts: GeneratorOptions
+) {
   const config = opts.config
   const prismaDir = path.join(folder, 'prisma')
   const prismaSchemaFile = path.join(prismaDir, 'schema.prisma')
   await fs.mkdir(prismaDir)
-  const output = path.resolve(config.CLIENT_PATH)
   const proxyUrl = buildProxyUrlForIntrospection(config)
+  const schema = dedent`
+    datasource db {
+      provider = "postgresql"
+      url      = "${proxyUrl}"
+    }`
+  await fs.writeFile(prismaSchemaFile, schema)
+  return prismaSchemaFile
+}
+
+/**
+ * Takes the Prisma schema that results from introspecting the DB
+ * and extends it with a generator for the Electric client.
+ * @param introspectedSchema The Prisma schema that results from introspecting the DB.
+ * @param prismaSchemaFile Path to the Prisma schema file.
+ * @returns The path to the Prisma schema file.
+ */
+async function createElectricClientSchema(
+  introspectedSchema: string,
+  prismaSchemaFile: string,
+  opts: GeneratorOptions
+) {
+  const config = opts.config
+  const output = path.resolve(config.CLIENT_PATH)
+
   const schema = dedent`
     generator electric {
       provider      = "node ${escapePathForString(generatorPath)}"
       output        = "${escapePathForString(output)}"
       relationModel = "false"
     }
+    
+    ${introspectedSchema}`
 
+  await fs.writeFile(prismaSchemaFile, schema)
+  return prismaSchemaFile
+}
+
+/**
+ * Takes the Prisma schema that results from introspecting the DB
+ * and extends it with a generator for the Prisma client.
+ * @param introspectedSchema The Prisma schema that results from introspecting the DB.
+ * @param prismaSchemaFile Path to the Prisma schema file.
+ * @returns The path to the Prisma schema file.
+ */
+async function createPrismaClientSchema(
+  introspectedSchema: string,
+  prismaSchemaFile: string,
+  opts: GeneratorOptions
+) {
+  const config = opts.config
+  const output = path.resolve(config.CLIENT_PATH)
+
+  const schema = dedent`
     generator client {
       provider = "prisma-client-js"
       output   = "${escapePathForString(output)}"
     }
+    
+    ${introspectedSchema}`
 
-    datasource db {
-      provider = "postgresql"
-      url      = "${proxyUrl}"
-    }`
   await fs.writeFile(prismaSchemaFile, schema)
   return prismaSchemaFile
 }
@@ -521,6 +577,13 @@ function addValidator(ln: string): string {
 }
 
 async function generateElectricClient(prismaSchema: string): Promise<void> {
+  await executeShellCommand(
+    `node ${prismaPath} generate --schema="${prismaSchema}"`,
+    'Generator script exited with error code: '
+  )
+}
+
+async function generatePrismaClient(prismaSchema: string): Promise<void> {
   await executeShellCommand(
     `node ${prismaPath} generate --schema="${prismaSchema}"`,
     'Generator script exited with error code: '

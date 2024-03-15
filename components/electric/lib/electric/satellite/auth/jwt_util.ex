@@ -16,6 +16,11 @@ defmodule Electric.Satellite.Auth.JWTUtil do
   # old `user_id` key for backwards compatibility.
   @legacy_user_id_key "user_id"
 
+  # The name of the claim which holds the expiration time in a JWT.
+  # `exp` is "expiration time" according to the JWT spec:
+  # https://www.rfc-editor.org/rfc/rfc7519#section-4.1.4
+  @expiration_key "exp"
+
   @doc """
   Fetch the User ID from the given map of claims.
 
@@ -62,6 +67,19 @@ defmodule Electric.Satellite.Auth.JWTUtil do
   end
 
   @doc """
+  Fetch the expiration from the given map of claims.
+
+  If `namespace` is `nil` or an empty string, the expiration is searched among the top-level claims. Otherwise, `claims`
+  must include the claim whose name matches `namespace` and whose value is a map containing the "#{@expiration_key}" key.
+  """
+  @spec fetch_exp(map, String.t() | nil) :: non_neg_integer()
+  # def fetch_exp(claims, namespace) when is_binary(namespace) and namespace != "" do
+  #    get_in(claims, [namespace, @expiration_key])
+  # end
+
+  def fetch_exp(claims, _), do: claims[@expiration_key]
+
+  @doc """
   Convert a given token validation error reason into a %TokenError{} with a human-readable error description.
   """
   @spec translate_error_reason(term) :: %TokenError{}
@@ -101,9 +119,19 @@ defmodule Electric.Satellite.Auth.JWTUtil do
   @doc false
   def peek_claims(token) do
     try do
-      Joken.peek_claims(token)
+      token
+      |> maybe_add_trailing_dot()
+      |> Joken.peek_claims()
     rescue
       Jason.DecodeError -> {:error, :token_malformed}
+    end
+  end
+
+  defp maybe_add_trailing_dot(token) do
+    case :binary.split(token, ".", [:global]) do
+      [_header, _payload] -> token <> "."
+      [_header, _payload, _signature] -> token
+      _ -> raise Jason.DecodeError
     end
   end
 

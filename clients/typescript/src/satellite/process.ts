@@ -10,7 +10,7 @@ import { Migrator } from '../migrators/index'
 import {
   AuthStateNotification,
   Change,
-  ConnectivityStateChangeNotification,
+  ChangeOrigin,
   Notifier,
   UnsubscribeFunction,
 } from '../notifiers/index'
@@ -20,17 +20,18 @@ import {
   bytesToNumber,
   emptyPromise,
   getWaiter,
-  uuid,
 } from '../util/common'
 import { QualifiedTablename } from '../util/tablename'
 import {
   ConnectivityState,
+  ConnectivityStatus,
   DataChange,
   DbName,
   LSN,
   MigrationTable,
   Relation,
   RelationsCache,
+  ReplicationStatus,
   SatelliteError,
   SatelliteErrorCode,
   SchemaChange,
@@ -38,9 +39,10 @@ import {
   Statement,
   Transaction,
   isDataChange,
+  Uuid,
 } from '../util/types'
 import { SatelliteOpts } from './config'
-import { Client, ConnectionWrapper, Satellite } from './index'
+import { Client, Satellite } from './index'
 import {
   OPTYPES,
   OplogEntry,
@@ -71,9 +73,11 @@ import {
   SubscriptionData,
 } from './shapes/types'
 import { backOff } from 'exponential-backoff'
-import { chunkBy } from '../util'
+import { chunkBy, genUUID } from '../util'
 import { isFatal, isOutOfSyncError, isThrowable, wrapFatalError } from './error'
 import { inferRelationsFromSQLite } from '../util/relations'
+import { decodeUserIdFromToken } from '../auth/secure'
+import { InvalidArgumentError } from '../client/validation/errors/invalidArgumentError'
 
 type ChangeAccumulator = {
   [key: string]: Change
@@ -87,8 +91,6 @@ type ThrottleFunction = {
   cancel: () => void
   (): Promise<Date> | undefined
 }
-
-type Uuid = `${string}-${string}-${string}-${string}-${string}`
 
 type MetaEntries = {
   clientId: Uuid | ''
@@ -183,7 +185,7 @@ export class SatelliteProcess implements Satellite {
     )
     this.subscriptionNotifiers = {}
 
-    this.subscriptionIdGenerator = () => uuid()
+    this.subscriptionIdGenerator = () => genUUID()
     this.shapeRequestIdGenerator = this.subscriptionIdGenerator
 
     this._connectRetryHandler = connectRetryHandler
@@ -203,7 +205,7 @@ export class SatelliteProcess implements Satellite {
     }
   }
 
-  async start(authConfig: AuthConfig): Promise<ConnectionWrapper> {
+  async start(authConfig?: AuthConfig): Promise<void> {
     if (this.opts.debug) {
       await this.logSQLiteVersion()
     }
@@ -216,10 +218,10 @@ export class SatelliteProcess implements Satellite {
     }
 
     const clientId =
-      authConfig.clientId && authConfig.clientId !== ''
+      authConfig?.clientId && authConfig.clientId !== ''
         ? authConfig.clientId
         : await this._getClientId()
-    await this._setAuthState({ clientId: clientId, token: authConfig.token })
+    this._setAuthState({ clientId: clientId })
 
     const notifierSubscriptions = Object.entries({
       _authStateSubscription: this._unsubscribeFromAuthState,
@@ -241,17 +243,6 @@ export class SatelliteProcess implements Satellite {
     const authStateHandler = this._updateAuthState.bind(this)
     this._unsubscribeFromAuthState =
       this.notifier.subscribeToAuthStateChanges(authStateHandler)
-
-    // Monitor connectivity state changes.
-    const connectivityStateHandler = ({
-      connectivityState,
-    }: ConnectivityStateChangeNotification) => {
-      this._handleConnectivityStateChange(connectivityState)
-    }
-    this._unsubscribeFromConnectivityChanges =
-      this.notifier.subscribeToConnectivityStateChanges(
-        connectivityStateHandler
-      )
 
     // Request a snapshot whenever the data in our database potentially changes.
     this._unsubscribeFromPotentialDataChanges =
@@ -282,9 +273,6 @@ export class SatelliteProcess implements Satellite {
     if (subscriptionsState) {
       this.subscriptions.setState(subscriptionsState)
     }
-
-    const connectionPromise = this._connectWithBackoff()
-    return { connectionPromise }
   }
 
   private async logSQLiteVersion(): Promise<void> {
@@ -294,7 +282,7 @@ export class SatelliteProcess implements Satellite {
     Log.info(`Using SQLite version: ${sqliteVersionRow[0]['version']}`)
   }
 
-  async _setAuthState(authState: AuthState): Promise<void> {
+  _setAuthState(authState: AuthState): void {
     this._authState = authState
   }
 
@@ -342,6 +330,10 @@ export class SatelliteProcess implements Satellite {
 
   // Unsubscribe from data changes and stop polling
   async stop(shutdown?: boolean): Promise<void> {
+    this._stop(shutdown)
+  }
+
+  private async _stop(shutdown?: boolean): Promise<void> {
     // Stop snapshotting and polling for changes.
     this._throttledSnapshot.cancel()
 
@@ -366,7 +358,7 @@ export class SatelliteProcess implements Satellite {
       }
     })
 
-    this._disconnect()
+    this.disconnect()
 
     if (shutdown) {
       this.client.shutdown()
@@ -487,7 +479,11 @@ export class SatelliteProcess implements Satellite {
 
     const groupedChanges = new Map<
       string,
-      { columns: string[]; records: InitialDataChange['record'][] }
+      {
+        relation: Relation
+        dataChanges: InitialDataChange[]
+        tableName: QualifiedTablename
+      }
     >()
 
     const allArgsForShadowInsert: Record<
@@ -498,12 +494,15 @@ export class SatelliteProcess implements Satellite {
     // Group all changes by table name to be able to insert them all together
     for (const op of changes) {
       const tableName = new QualifiedTablename('main', op.relation.table)
-      if (groupedChanges.has(tableName.toString())) {
-        groupedChanges.get(tableName.toString())?.records.push(op.record)
+      const tableNameString = tableName.toString()
+      if (groupedChanges.has(tableNameString)) {
+        const changeGroup = groupedChanges.get(tableNameString)!
+        changeGroup.dataChanges.push(op)
       } else {
-        groupedChanges.set(tableName.toString(), {
-          columns: op.relation.columns.map((x) => x.name),
-          records: [op.record],
+        groupedChanges.set(tableNameString, {
+          relation: op.relation,
+          dataChanges: [op],
+          tableName: tableName,
         })
       }
 
@@ -526,13 +525,15 @@ export class SatelliteProcess implements Satellite {
     stmts.push(...this._disableTriggers([...groupedChanges.keys()]))
 
     // For each table, do a batched insert
-    for (const [table, { columns, records }] of groupedChanges) {
-      const sqlBase = `INSERT INTO ${table} (${columns.join(', ')}) VALUES `
+    for (const [table, { relation, dataChanges }] of groupedChanges) {
+      const records = dataChanges.map((change) => change.record)
+      const columnNames = relation.columns.map((col) => col.name)
+      const sqlBase = `INSERT INTO ${table} (${columnNames.join(', ')}) VALUES `
 
       stmts.push(
         ...prepareInsertBatchedStatements(
           sqlBase,
-          columns,
+          columnNames,
           records as Record<string, SqlValue>[],
           this.maxSqlParameters
         )
@@ -565,11 +566,27 @@ export class SatelliteProcess implements Satellite {
       // We're explicitly not specifying rowids in these changes for now,
       // because nobody uses them and we don't have the machinery to to a
       // `RETURNING` clause in the middle of `runInTransaction`.
-      const notificationChanges: Change[] = changes.map((x) => ({
-        qualifiedTablename: new QualifiedTablename('main', x.relation.table),
-        rowids: [],
-      }))
-      this.notifier.actuallyChanged(this.dbName, notificationChanges)
+      const notificationChanges: Change[] = []
+      groupedChanges.forEach(({ dataChanges, tableName, relation }) => {
+        const primaryKeyColNames = relation.columns
+          .filter((col) => col.primaryKey)
+          .map((col) => col.name)
+        notificationChanges.push({
+          qualifiedTablename: tableName,
+          rowids: [],
+          recordChanges: dataChanges.map((change) => {
+            return {
+              primaryKey: Object.fromEntries(
+                primaryKeyColNames.map((col_name) => {
+                  return [col_name, change.record[col_name]]
+                })
+              ),
+              type: 'INITIAL',
+            }
+          }),
+        })
+      })
+      this.notifier.actuallyChanged(this.dbName, notificationChanges, 'initial')
     } catch (e) {
       this._handleSubscriptionError(
         new SatelliteError(
@@ -584,7 +601,7 @@ export class SatelliteProcess implements Satellite {
     keepSubscribedShapes: boolean
   }): Promise<void> {
     Log.warn(`resetting client state`)
-    this._disconnect()
+    this.disconnect()
     const subscriptionIds = this.subscriptions.getFulfilledSubscriptions()
 
     if (opts?.keepSubscribedShapes) {
@@ -625,7 +642,7 @@ export class SatelliteProcess implements Satellite {
     }
   }
 
-  // handles async client erros: can be a socket error or a server error message
+  // handles async client errors: can be a socket error or a server error message
   _handleClientError(satelliteError: SatelliteError) {
     if (this.initializing && !this.initializing.finished()) {
       if (satelliteError.code === SatelliteErrorCode.SOCKET_ERROR) {
@@ -652,8 +669,18 @@ export class SatelliteProcess implements Satellite {
     this._handleOrThrowClientError(satelliteError)
   }
 
-  _handleOrThrowClientError(error: SatelliteError): Promise<void> {
-    this._disconnect()
+  async _handleOrThrowClientError(error: SatelliteError): Promise<void> {
+    if (error.code === SatelliteErrorCode.AUTH_EXPIRED) {
+      Log.warn('Connection closed by Electric because the JWT expired.')
+      return this.disconnect(
+        new SatelliteError(
+          error.code,
+          'Connection closed by Electric because the JWT expired.'
+        )
+      )
+    }
+
+    this.disconnect(error)
 
     if (isThrowable(error)) {
       throw error
@@ -663,32 +690,50 @@ export class SatelliteProcess implements Satellite {
     }
 
     Log.warn('Client disconnected with a non fatal error, reconnecting')
-    return this._connectWithBackoff()
+    return this.connectWithBackoff()
   }
 
-  async _handleConnectivityStateChange(
-    status: ConnectivityState
-  ): Promise<void> {
-    Log.debug(`Connectivity state changed: ${status}`)
-    switch (status) {
-      case 'available': {
-        Log.warn(`checking network availability and reconnecting`)
-        return this._connectWithBackoff()
-      }
-      case 'disconnected': {
-        this.client.disconnect()
-        return
-      }
-      case 'connected': {
-        return
-      }
-      default: {
-        throw new Error(`unexpected connectivity state: ${status}`)
-      }
+  /**
+   * Sets the JWT token.
+   * @param token The JWT token.
+   */
+  setToken(token: string): void {
+    const newUserId = decodeUserIdFromToken(token)
+    const userId: string | undefined = this._authState?.userId
+    if (typeof userId !== 'undefined' && newUserId !== userId) {
+      // We must check that the new token is still using the same user ID.
+      // We can't accept a re-connection that changes the user ID because the Satellite process is statefull.
+      // To change user ID the user must re-electrify the database.
+      throw new InvalidArgumentError(
+        `Can't change user ID when reconnecting. Previously connected with user ID '${userId}' but trying to reconnect with user ID '${newUserId}'`
+      )
     }
+    this._setAuthState({
+      ...this._authState!,
+      userId: newUserId,
+      token,
+    })
   }
 
-  async _connectWithBackoff(): Promise<void> {
+  /**
+   * @returns True if a JWT token has been set previously. False otherwise.
+   */
+  hasToken(): boolean {
+    return this._authState?.token !== undefined
+  }
+
+  async connectWithBackoff(): Promise<void> {
+    if (this.client.isConnected()) {
+      // we're already connected
+      return
+    }
+
+    if (this.initializing && !this.initializing.finished()) {
+      // we're already trying to connect to Electric
+      // return the promise that resolves when the connection is established
+      return this.initializing.waitOn()
+    }
+
     if (!this.initializing || this.initializing?.finished()) {
       this.initializing = getWaiter()
     }
@@ -698,7 +743,12 @@ export class SatelliteProcess implements Satellite {
       retry: this._connectRetryHandler,
     }
 
+    const prom = this.initializing.waitOn()
+
     await backOff(async () => {
+      if (this.initializing?.finished()) {
+        return prom
+      }
       await this._connect()
       await this._startReplication()
       this._subscribePreviousShapeRequests()
@@ -714,10 +764,12 @@ export class SatelliteProcess implements Satellite {
             SatelliteErrorCode.CONNECTION_FAILED_AFTER_RETRY,
             `Failed to connect to server after exhausting retry policy. Last error thrown by server: ${e.message}`
           )
-      this._disconnect()
+
+      this.disconnect(error)
       this.initializing?.reject(error)
-      throw error
     })
+
+    return prom
   }
 
   _subscribePreviousShapeRequests(): void {
@@ -741,18 +793,13 @@ export class SatelliteProcess implements Satellite {
   private async _connect(): Promise<void> {
     Log.info(`connecting to electric server`)
 
-    if (!this._authState) {
+    if (!this._authState || !this._authState.token) {
       throw new Error(`trying to connect before authentication`)
     }
-    const authState = this._authState
 
     try {
       await this.client.connect()
-      const authResp = await this.client.authenticate(authState)
-
-      if (authResp.error) {
-        throw authResp.error
-      }
+      await this.authenticate(this._authState!.token!)
     } catch (error: any) {
       Log.debug(
         `server returned an error while establishing connection: ${error.message}`
@@ -761,9 +808,43 @@ export class SatelliteProcess implements Satellite {
     }
   }
 
-  private _disconnect(): void {
+  /**
+   * Authenticates with the Electric sync service using the provided token.
+   * @returns A promise that resolves to void if authentication succeeded. Otherwise, rejects with the reason for the error.
+   */
+  async authenticate(token: string): Promise<void> {
+    const authState = {
+      clientId: this._authState!.clientId,
+      token,
+    }
+    const authResp = await this.client.authenticate(authState)
+    if (authResp.error) {
+      throw authResp.error
+    }
+    this._setAuthState(authState)
+  }
+
+  cancelConnectionWaiter(error: SatelliteError): void {
+    if (this.initializing && !this.initializing.finished()) {
+      this.initializing?.reject(error)
+    }
+  }
+
+  disconnect(error?: SatelliteError): void {
     this.client.disconnect()
-    this._notifyConnectivityState('disconnected')
+    this._notifyConnectivityState('disconnected', error)
+  }
+
+  /**
+   * A disconnection issued by the client.
+   */
+  clientDisconnect(): void {
+    const error = new SatelliteError(
+      SatelliteErrorCode.CONNECTION_CANCELLED_BY_DISCONNECT,
+      `Connection cancelled by 'disconnect'`
+    )
+    this.disconnect(error)
+    this.cancelConnectionWaiter(error)
   }
 
   async _startReplication(): Promise<void> {
@@ -807,8 +888,14 @@ export class SatelliteProcess implements Satellite {
     }
   }
 
-  private _notifyConnectivityState(connectivityState: ConnectivityState): void {
-    this.connectivityState = connectivityState
+  private _notifyConnectivityState(
+    connectivityStatus: ConnectivityStatus,
+    error?: SatelliteError
+  ): void {
+    this.connectivityState = {
+      status: connectivityStatus,
+      reason: error,
+    }
     this.notifier.connectivityStateChanged(this.dbName, this.connectivityState)
   }
 
@@ -886,24 +973,21 @@ export class SatelliteProcess implements Satellite {
         args: [timestamp.toISOString()],
       }
 
-      // For each first oplog entry per element, set `clearTags` array to previous tags from the shadow table
+      // We're adding new tag to the shadow tags for this row
       const q2: Statement = {
         sql: `
       UPDATE ${oplog}
-      SET clearTags = updates.tags
-      FROM (
-        SELECT shadow.tags as tags, min(op.rowid) as op_rowid
-        FROM ${shadow} AS shadow
-        JOIN ${oplog} as op
-          ON op.namespace = shadow.namespace
-            AND op.tablename = shadow.tablename
-            AND op.primaryKey = shadow.primaryKey
-        WHERE op.timestamp = ?
-        GROUP BY op.namespace, op.tablename, op.primaryKey
-      ) AS updates
-      WHERE updates.op_rowid = ${oplog}.rowid
+      SET clearTags =
+          CASE WHEN shadow.tags = '[]' OR shadow.tags = ''
+               THEN '["' || ? || '"]'
+               ELSE '["' || ? || '",' || substring(shadow.tags, 2)
+          END
+      FROM ${shadow} AS shadow
+      WHERE ${oplog}.namespace = shadow.namespace
+          AND ${oplog}.tablename = shadow.tablename
+          AND ${oplog}.primaryKey = shadow.primaryKey AND ${oplog}.timestamp = ?
       `,
-        args: [timestamp.toISOString()],
+        args: [newTag, newTag, timestamp.toISOString()],
       }
 
       // For each affected shadow row, set new tag array, unless the last oplog operation was a DELETE
@@ -957,9 +1041,11 @@ export class SatelliteProcess implements Satellite {
         }
       )) as OplogEntry[]
 
-      if (oplogEntries.length > 0) this._notifyChanges(oplogEntries)
+      if (oplogEntries.length > 0) this._notifyChanges(oplogEntries, 'local')
 
-      if (this.client.isConnected()) {
+      if (
+        this.client.getOutboundReplicationStatus() === ReplicationStatus.ACTIVE
+      ) {
         const enqueued = this.client.getLastSentLsn()
         const enqueuedLogPos = bytesToNumber(enqueued)
 
@@ -977,7 +1063,10 @@ export class SatelliteProcess implements Satellite {
     }
   }
 
-  async _notifyChanges(results: OplogEntry[]): Promise<void> {
+  async _notifyChanges(
+    results: OplogEntry[],
+    origin: ChangeOrigin
+  ): Promise<void> {
     Log.info('notify changes')
     const acc: ChangeAccumulator = {}
 
@@ -993,12 +1082,25 @@ export class SatelliteProcess implements Satellite {
         if (change.rowids === undefined) {
           change.rowids = []
         }
+        if (change.recordChanges === undefined) {
+          change.recordChanges = []
+        }
 
         change.rowids.push(entry.rowid)
+        change.recordChanges.push({
+          primaryKey: JSON.parse(entry.primaryKey),
+          type: entry.optype,
+        })
       } else {
         acc[key] = {
           qualifiedTablename: qt,
           rowids: [entry.rowid],
+          recordChanges: [
+            {
+              primaryKey: JSON.parse(entry.primaryKey),
+              type: entry.optype,
+            },
+          ],
         }
       }
 
@@ -1006,12 +1108,13 @@ export class SatelliteProcess implements Satellite {
     }
 
     const changes = Object.values(results.reduce(reduceFn, acc))
-    this.notifier.actuallyChanged(this.dbName, changes)
+    this.notifier.actuallyChanged(this.dbName, changes, origin)
   }
 
   async _replicateSnapshotChanges(results: OplogEntry[]): Promise<void> {
-    // TODO: Don't try replicating when outbound is inactive
-    if (!this.client.isConnected()) {
+    if (
+      this.client.getOutboundReplicationStatus() != ReplicationStatus.ACTIVE
+    ) {
       return
     }
 
@@ -1273,7 +1376,7 @@ export class SatelliteProcess implements Satellite {
       await this.adapter.runInTransaction(...allStatements)
     }
 
-    await this._notifyChanges(opLogEntries)
+    await this._notifyChanges(opLogEntries, 'remote')
   }
 
   private async maybeGarbageCollect(
@@ -1366,7 +1469,7 @@ export class SatelliteProcess implements Satellite {
     let clientId = await this._getMeta(clientIdKey)
 
     if (clientId === '') {
-      clientId = uuid() as Uuid
+      clientId = genUUID()
       await this._setMeta(clientIdKey, clientId)
     }
     return clientId

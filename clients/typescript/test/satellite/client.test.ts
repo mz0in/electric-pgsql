@@ -18,6 +18,7 @@ import { RpcResponse, SatelliteWSServerStub } from './server_ws_stub'
 import { DbSchema, TableSchema } from '../../src/client/model/schema'
 import { PgBasicType } from '../../src/client/conversions/types'
 import { HKT } from '../../src/client/util/hkt'
+import { AUTH_EXPIRED_CLOSE_EVENT } from '../../src/sockets'
 
 interface Context extends AuthState {
   server: SatelliteWSServerStub
@@ -204,6 +205,56 @@ test.serial('replication stop failure', async (t) => {
   } catch (error) {
     t.is((error as any).code, SatelliteErrorCode.REPLICATION_NOT_STARTED)
   }
+})
+
+test.serial('handle socket closure due to JWT expiration', async (t) => {
+  await connectAndAuth(t.context)
+  const { client, server } = t.context
+  await startReplication(client, server)
+
+  // We're expecting 1 assertion
+  t.plan(2)
+
+  // subscribe to errors on the client using subscribeToError
+  client.subscribeToError((error) => {
+    // check that the subscribed listener is called with the right reason
+    t.is(error.code, SatelliteErrorCode.AUTH_EXPIRED)
+  })
+
+  // close the socket with a JWT expired reason
+  server.closeSocket(AUTH_EXPIRED_CLOSE_EVENT)
+
+  // Give `closeSocket` some time
+  await sleepAsync(100)
+
+  t.false(client.isConnected())
+
+  server.close()
+})
+
+test.serial('handle socket closure for other reasons', async (t) => {
+  await connectAndAuth(t.context)
+  const { client, server } = t.context
+  await startReplication(client, server)
+
+  // We're expecting 2 assertions
+  t.plan(2)
+
+  // subscribe to errors on the client using subscribeToError
+  client.subscribeToError((error) => {
+    // check that the subscribed listener is called with the right reason
+    t.is(error.code, SatelliteErrorCode.SOCKET_ERROR)
+  })
+
+  // close the socket with a JWT expired reason
+  server.closeSocket()
+
+  // Give `closeSocket` some time
+  await sleepAsync(100)
+
+  t.false(client.isConnected())
+
+  server.close()
 })
 
 test.serial('receive transaction over multiple messages', async (t) => {
@@ -737,6 +788,32 @@ test.serial('subscription succesful', async (t) => {
   const subscriptionId = 'THE_ID'
   const subsResp = Proto.SatSubsResp.fromPartial({ subscriptionId })
   server.nextRpcResponse('subscribe', [subsResp])
+
+  const res = await client.subscribe(subscriptionId, [shapeReq])
+  t.is(res.subscriptionId, subscriptionId)
+})
+
+test.serial('RPC subscribe flow is not interleaved', async (t) => {
+  // SatSubsDataEnd cannot be received before SatSubsResp, otherwise
+  // we would get an error: 'Received subscribe response for unknown subscription <id>'
+  // On Github https://github.com/electric-sql/electric/pull/985
+  await connectAndAuth(t.context)
+  const { client, server } = t.context
+  await startReplication(client, server)
+
+  const shapeReq: ShapeRequest = {
+    requestId: 'fake',
+    definition: {
+      selects: [{ tablename: 'fake' }],
+    },
+  }
+
+  const subscriptionId = 'THE_ID'
+  const subsResp = Proto.SatSubsResp.fromPartial({ subscriptionId })
+  const beginSub = Proto.SatSubsDataBegin.fromPartial({ subscriptionId })
+  const endSub = Proto.SatSubsDataEnd.create()
+  // By not adding a delay in between messages we trigger the interleaving
+  server.nextRpcResponse('subscribe', [subsResp, beginSub, endSub])
 
   const res = await client.subscribe(subscriptionId, [shapeReq])
   t.is(res.subscriptionId, subscriptionId)
